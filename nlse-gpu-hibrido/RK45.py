@@ -1,0 +1,538 @@
+import numpy as np
+#import cupy as np
+#from .base import OdeSolver, DenseOutput
+#from .common import (validate_max_step, validate_tol, select_initial_step,
+#                     norm, warn_extraneous, validate_first_step)
+#from . import dop853_coefficients
+
+# Multiply steps computed from asymptotic behaviour of errors by this.
+SAFETY = 0.9
+
+MIN_FACTOR = 0.2  # Minimum allowed decrease in a step size.
+MAX_FACTOR = 10  # Maximum allowed increase in a step size.
+
+#def rk_step(fun, t, y, f, h, A, B, C, K):
+"""Perform a single Runge-Kutta step.
+
+    This function computes a prediction of an explicit Runge-Kutta method and
+    also estimates the error of a less accurate method.
+
+    Notation for Butcher tableau is as in [1]_.
+
+    Parameters
+    ----------
+    fun : callable
+        Right-hand side of the system.
+    t : float
+        Current time.
+    y : ndarray, shape (n,)
+        Current state.
+    f : ndarray, shape (n,)
+        Current value of the derivative, i.e., ``fun(x, y)``.
+    h : float
+        Step to use.
+    A : ndarray, shape (n_stages, n_stages)
+        Coefficients for combining previous RK stages to compute the next
+        stage. For explicit methods the coefficients at and above the main
+        diagonal are zeros.
+    B : ndarray, shape (n_stages,)
+        Coefficients for combining RK stages for computing the final
+        prediction.
+    C : ndarray, shape (n_stages,)
+        Coefficients for incrementing time for consecutive RK stages.
+        The value for the first stage is always zero.
+    K : ndarray, shape (n_stages + 1, n)
+        Storage array for putting RK stages here. Stages are stored in rows.
+        The last row is a linear combination of the previous rows with
+        coefficients
+
+    Returns
+    -------
+    y_new : ndarray, shape (n,)
+        Solution at t + h computed with a higher accuracy.
+    f_new : ndarray, shape (n,)
+        Derivative ``fun(t + h, y_new)``.
+
+    References
+    ----------
+    .. [1] E. Hairer, S. P. Norsett G. Wanner, "Solving Ordinary Differential
+           Equations I: Nonstiff Problems", Sec. II.4.
+    
+    K[0] = f
+    for s, (a, c) in enumerate(zip(A[1:], C[1:]), start=1):
+        dy = np.dot(K[:s].T, a[:s]) * h
+        K[s] = fun(t + c * h, y + dy)
+
+    y_new = y + h * np.dot(K[:-1].T, B)
+    f_new = fun(t + h, y_new)
+
+    K[-1] = f_new
+
+    return y_new, f_new
+"""
+
+#class RungeKutta(OdeSolver):
+"""Base class for explicit Runge-Kutta methods."""
+"""C: np.ndarray = NotImplemented
+    A: np.ndarray = NotImplemented
+    B: np.ndarray = NotImplemented
+    E: np.ndarray = NotImplemented
+    P: np.ndarray = NotImplemented
+    order: int = NotImplemented
+    error_estimator_order: int = NotImplemented
+    n_stages: int = NotImplemented
+
+    def __init__(self, fun, t0, y0, t_bound, max_step=np.inf,
+                 rtol=1e-3, atol=1e-6, vectorized=False,
+                 first_step=None, **extraneous):
+        warn_extraneous(extraneous)
+        super().__init__(fun, t0, y0, t_bound, vectorized,
+                         support_complex=True)
+        self.y_old = None
+        self.max_step = validate_max_step(max_step)
+        self.rtol, self.atol = validate_tol(rtol, atol, self.n)
+        self.f = self.fun(self.t, self.y)
+        if first_step is None:
+            self.h_abs = select_initial_step(
+                self.fun, self.t, self.y, t_bound, max_step, self.f, self.direction,
+                self.error_estimator_order, self.rtol, self.atol)
+        else:
+            self.h_abs = validate_first_step(first_step, t0, t_bound)
+        self.K = np.empty((self.n_stages + 1, self.n), dtype=self.y.dtype)
+        self.error_exponent = -1 / (self.error_estimator_order + 1)
+        self.h_previous = None
+
+    def _estimate_error(self, K, h):
+        return np.dot(K.T, self.E) * h
+
+    def _estimate_error_norm(self, K, h, scale):
+        return norm(self._estimate_error(K, h) / scale)
+
+    def _step_impl(self):
+        t = self.t
+        y = self.y
+
+        max_step = self.max_step
+        rtol = self.rtol
+        atol = self.atol
+
+        min_step = 10 * np.abs(np.nextafter(t, self.direction * np.inf) - t)
+
+        if self.h_abs > max_step:
+            h_abs = max_step
+        elif self.h_abs < min_step:
+            h_abs = min_step
+        else:
+            h_abs = self.h_abs
+
+        step_accepted = False
+        step_rejected = False
+
+        while not step_accepted:
+            if h_abs < min_step:
+                return False, self.TOO_SMALL_STEP
+
+            h = h_abs * self.direction
+            t_new = t + h
+
+            if self.direction * (t_new - self.t_bound) > 0:
+                t_new = self.t_bound
+
+            h = t_new - t
+            h_abs = np.abs(h)
+
+            y_new, f_new = rk_step(self.fun, t, y, self.f, h, self.A,
+                                   self.B, self.C, self.K)
+            scale = atol + np.maximum(np.abs(y), np.abs(y_new)) * rtol
+            error_norm = self._estimate_error_norm(self.K, h, scale)
+
+            if error_norm < 1:
+                if error_norm == 0:
+                    factor = MAX_FACTOR
+                else:
+                    factor = min(MAX_FACTOR,
+                                 SAFETY * error_norm ** self.error_exponent)
+
+                if step_rejected:
+                    factor = min(1, factor)
+
+                h_abs *= factor
+
+                step_accepted = True
+            else:
+                h_abs *= max(MIN_FACTOR,
+                             SAFETY * error_norm ** self.error_exponent)
+                step_rejected = True
+
+        self.h_previous = h
+        self.y_old = y
+
+        self.t = t_new
+        self.y = y_new
+
+        self.h_abs = h_abs
+        self.f = f_new
+
+        return True, None
+
+    def _dense_output_impl(self):
+        Q = self.K.T.dot(self.P)
+        return RkDenseOutput(self.t_old, self.t, self.y_old, Q)"""
+
+
+#class RK23(RungeKutta):
+"""Explicit Runge-Kutta method of order 3(2).
+
+    This uses the Bogacki-Shampine pair of formulas [1]_. The error is controlled
+    assuming accuracy of the second-order method, but steps are taken using the
+    third-order accurate formula (local extrapolation is done). A cubic Hermite
+    polynomial is used for the dense output.
+
+    Can be applied in the complex domain.
+
+    Parameters
+    ----------
+    fun : callable
+        Right-hand side of the system: the time derivative of the state ``y``
+        at time ``t``. The calling signature is ``fun(t, y)``, where ``t`` is a
+        scalar and ``y`` is an ndarray with ``len(y) = len(y0)``. ``fun`` must
+        return an array of the same shape as ``y``. See `vectorized` for more
+        information.
+    t0 : float
+        Initial time.
+    y0 : array_like, shape (n,)
+        Initial state.
+    t_bound : float
+        Boundary time - the integration won't continue beyond it. It also
+        determines the direction of the integration.
+    first_step : float or None, optional
+        Initial step size. Default is ``None`` which means that the algorithm
+        should choose.
+    max_step : float, optional
+        Maximum allowed step size. Default is np.inf, i.e., the step size is not
+        bounded and determined solely by the solver.
+    rtol, atol : float and array_like, optional
+        Relative and absolute tolerances. The solver keeps the local error
+        estimates less than ``atol + rtol * abs(y)``. Here `rtol` controls a
+        relative accuracy (number of correct digits), while `atol` controls
+        absolute accuracy (number of correct decimal places). To achieve the
+        desired `rtol`, set `atol` to be smaller than the smallest value that
+        can be expected from ``rtol * abs(y)`` so that `rtol` dominates the
+        allowable error. If `atol` is larger than ``rtol * abs(y)`` the
+        number of correct digits is not guaranteed. Conversely, to achieve the
+        desired `atol` set `rtol` such that ``rtol * abs(y)`` is always smaller
+        than `atol`. If components of y have different scales, it might be
+        beneficial to set different `atol` values for different components by
+        passing array_like with shape (n,) for `atol`. Default values are
+        1e-3 for `rtol` and 1e-6 for `atol`.
+    vectorized : bool, optional
+        Whether `fun` may be called in a vectorized fashion. False (default)
+        is recommended for this solver.
+
+        If ``vectorized`` is False, `fun` will always be called with ``y`` of
+        shape ``(n,)``, where ``n = len(y0)``.
+
+        If ``vectorized`` is True, `fun` may be called with ``y`` of shape
+        ``(n, k)``, where ``k`` is an integer. In this case, `fun` must behave
+        such that ``fun(t, y)[:, i] == fun(t, y[:, i])`` (i.e. each column of
+        the returned array is the time derivative of the state corresponding
+        with a column of ``y``).
+
+        Setting ``vectorized=True`` allows for faster finite difference
+        approximation of the Jacobian by methods 'Radau' and 'BDF', but
+        will result in slower execution for this solver.
+
+    Attributes
+    ----------
+    n : int
+        Number of equations.
+    status : string
+        Current status of the solver: 'running', 'finished' or 'failed'.
+    t_bound : float
+        Boundary time.
+    direction : float
+        Integration direction: +1 or -1.
+    t : float
+        Current time.
+    y : ndarray
+        Current state.
+    t_old : float
+        Previous time. None if no steps were made yet.
+    step_size : float
+        Size of the last successful step. None if no steps were made yet.
+    nfev : int
+        Number evaluations of the system's right-hand side.
+    njev : int
+        Number of evaluations of the Jacobian.
+        Is always 0 for this solver as it does not use the Jacobian.
+    nlu : int
+        Number of LU decompositions. Is always 0 for this solver.
+
+    References
+    ----------
+    .. [1] P. Bogacki, L.F. Shampine, "A 3(2) Pair of Runge-Kutta Formulas",
+           Appl. Math. Lett. Vol. 2, No. 4. pp. 321-325, 1989.
+    order = 3
+    error_estimator_order = 2
+    n_stages = 3
+    C = np.array([0, 1/2, 3/4])
+    A = np.array([
+        [0, 0, 0],
+        [1/2, 0, 0],
+        [0, 3/4, 0]
+    ])
+    B = np.array([2/9, 1/3, 4/9])
+    E = np.array([5/72, -1/12, -1/9, 1/8])
+    P = np.array([[1, -4 / 3, 5 / 9],
+                  [0, 1, -2/3],
+                  [0, 4/3, -8/9],
+                  [0, -1, 1]])"""
+
+
+#class RK45(RungeKutta):
+"""Explicit Runge-Kutta method of order 5(4).
+
+    This uses the Dormand-Prince pair of formulas [1]_. The error is controlled
+    assuming accuracy of the fourth-order method accuracy, but steps are taken
+    using the fifth-order accurate formula (local extrapolation is done).
+    A quartic interpolation polynomial is used for the dense output [2]_.
+
+    Can be applied in the complex domain.
+
+    Parameters
+    ----------
+    fun : callable
+        Right-hand side of the system. The calling signature is ``fun(t, y)``.
+        Here ``t`` is a scalar, and there are two options for the ndarray ``y``:
+        It can either have shape (n,); then ``fun`` must return array_like with
+        shape (n,). Alternatively it can have shape (n, k); then ``fun``
+        must return an array_like with shape (n, k), i.e., each column
+        corresponds to a single column in ``y``. The choice between the two
+        options is determined by `vectorized` argument (see below).
+    t0 : float
+        Initial time.
+    y0 : array_like, shape (n,)
+        Initial state.
+    t_bound : float
+        Boundary time - the integration won't continue beyond it. It also
+        determines the direction of the integration.
+    first_step : float or None, optional
+        Initial step size. Default is ``None`` which means that the algorithm
+        should choose.
+    max_step : float, optional
+        Maximum allowed step size. Default is np.inf, i.e., the step size is not
+        bounded and determined solely by the solver.
+    rtol, atol : float and array_like, optional
+        Relative and absolute tolerances. The solver keeps the local error
+        estimates less than ``atol + rtol * abs(y)``. Here `rtol` controls a
+        relative accuracy (number of correct digits), while `atol` controls
+        absolute accuracy (number of correct decimal places). To achieve the
+        desired `rtol`, set `atol` to be smaller than the smallest value that
+        can be expected from ``rtol * abs(y)`` so that `rtol` dominates the
+        allowable error. If `atol` is larger than ``rtol * abs(y)`` the
+        number of correct digits is not guaranteed. Conversely, to achieve the
+        desired `atol` set `rtol` such that ``rtol * abs(y)`` is always smaller
+        than `atol`. If components of y have different scales, it might be
+        beneficial to set different `atol` values for different components by
+        passing array_like with shape (n,) for `atol`. Default values are
+        1e-3 for `rtol` and 1e-6 for `atol`.
+    vectorized : bool, optional
+        Whether `fun` is implemented in a vectorized fashion. Default is False.
+
+    Attributes
+    ----------
+    n : int
+        Number of equations.
+    status : string
+        Current status of the solver: 'running', 'finished' or 'failed'.
+    t_bound : float
+        Boundary time.
+    direction : float
+        Integration direction: +1 or -1.
+    t : float
+        Current time.
+    y : ndarray
+        Current state.
+    t_old : float
+        Previous time. None if no steps were made yet.
+    step_size : float
+        Size of the last successful step. None if no steps were made yet.
+    nfev : int
+        Number evaluations of the system's right-hand side.
+    njev : int
+        Number of evaluations of the Jacobian.
+        Is always 0 for this solver as it does not use the Jacobian.
+    nlu : int
+        Number of LU decompositions. Is always 0 for this solver.
+
+    References
+    ----------
+    .. [1] J. R. Dormand, P. J. Prince, "A family of embedded Runge-Kutta
+           formulae", Journal of Computational and Applied Mathematics, Vol. 6,
+           No. 1, pp. 19-26, 1980.
+    .. [2] L. W. Shampine, "Some Practical Runge-Kutta Formulas", Mathematics
+           of Computation,, Vol. 46, No. 173, pp. 135-150, 1986.
+    order = 5
+    error_estimator_order = 4
+    n_stages = 6
+    C = np.array([0, 1/5, 3/10, 4/5, 8/9, 1])
+    A = np.array([
+        [0, 0, 0, 0, 0],
+        [1/5, 0, 0, 0, 0],
+        [3/40, 9/40, 0, 0, 0],
+        [44/45, -56/15, 32/9, 0, 0],
+        [19372/6561, -25360/2187, 64448/6561, -212/729, 0],
+        [9017/3168, -355/33, 46732/5247, 49/176, -5103/18656]
+    ])
+    B = np.array([35/384, 0, 500/1113, 125/192, -2187/6784, 11/84])
+    E = np.array([-71/57600, 0, 71/16695, -71/1920, 17253/339200, -22/525,
+                  1/40])
+    # Corresponds to the optimum value of c_6 from [2]_.
+    P = np.array([
+        [1, -8048581381/2820520608, 8663915743/2820520608,
+         -12715105075/11282082432],
+        [0, 0, 0, 0],
+        [0, 131558114200/32700410799, -68118460800/10900136933,
+         87487479700/32700410799],
+        [0, -1754552775/470086768, 14199869525/1410260304,
+         -10690763975/1880347072],
+        [0, 127303824393/49829197408, -318862633887/49829197408,
+         701980252875 / 199316789632],
+        [0, -282668133/205662961, 2019193451/616988883, -1453857185/822651844],
+        [0, 40617522/29380423, -110615467/29380423, 69997945/29380423]])"""
+
+
+def rk45_gpu(f, t0, y0, t_final, tol=1e-6, max_steps=10000, z_locs = None):
+    """
+    Runge-Kutta 4(5) method with adaptive step size using CuPy for GPU acceleration.
+    
+    Parameters:
+    f : function
+        Function representing the system of ODEs, f(t, y), returning a CuPy array.
+    t0 : float
+        Initial time.
+    y0 : cupy.ndarray
+        Initial condition.
+    t_final : float
+        Final time.
+    tol : float, optional
+        Error tolerance for adaptive step sizing.
+    max_steps : int, optional
+        Maximum number of integration steps.
+
+    Returns:
+    t_vals : cupy.ndarray
+        Time points where the solution was computed.
+    y_vals : list of cupy.ndarray
+        Solution values at corresponding time points.
+    """
+    # Dormand-Prince coefficients for RK45
+    a = np.array([0, 1/5, 3/10, 4/5, 8/9, 1, 1])
+    b = np.array([
+        [0, 0, 0, 0, 0, 0],
+        [1/5, 0, 0, 0, 0, 0],
+        [3/40, 9/40, 0, 0, 0, 0],
+        [44/45, -56/15, 32/9, 0, 0, 0],
+        [19372/6561, -25360/2187, 64448/6561, -212/729, 0, 0],
+        [9017/3168, -355/33, 46732/5247, 49/176, -5103/18656, 0],
+        [35/384, 0, 500/1113, 125/192, -2187/6784, 11/84]
+    ])
+    c4 = np.array([35/384, 0, 500/1113, 125/192, -2187/6784, 11/84, 0])
+    c5 = np.array([5179/57600, 0, 7571/16695, 393/640, -92097/339200, 187/2100, 1/40])
+    
+    # Initialization
+    t_vals = [t0]
+    y_vals = [y0]
+    t = t0
+    y = y0
+    h = (t_final - t0) / 100  # Initial step size guess
+    safety = 0.9
+    min_factor, max_factor = 0.2, 5.0
+    
+    for _ in range(max_steps):
+        if t >= t_final:
+            break
+        
+        # Compute Runge-Kutta stages
+        k = np.zeros((7, len(y0)),dtype=complex)
+        for i in range(7):
+            ti = t + a[i] * h
+            yi = y + h * np.sum(b[i, :i, None] * k[:i], axis=0)
+            k[i] = f(ti, yi)
+        
+        # Compute fourth and fifth order estimates
+        y4 = y + h * np.sum(c4[:, None] * k, axis=0)
+        y5 = y + h * np.sum(c5[:, None] * k, axis=0)
+        
+        # Error estimation
+        err = np.linalg.norm(y5 - y4, ord=2) / np.linalg.norm(y5, ord=2)
+        
+        # Step size control
+        if err < tol:
+            t += h
+            y = y5
+            t_vals.append(t)
+            y_vals.append(y)
+        
+        # Adjust step size
+        h_new = h * safety * (tol / (err + 1e-10))**0.2
+        h = np.clip(h_new, min_factor * h, max_factor * h)
+        
+        # Ensure we don't overshoot final time
+        if t + h > t_final:
+            h = t_final - t
+    
+    return t_vals, y_vals
+
+def rk45_solver(fun, z_span, y0, args=(), atol=1e-6, rtol=1e-3, max_step=0.1, zlocs=None):
+    z0, zf = z_span
+    z = z0
+    y = np.array(y0, dtype=np.complex128)
+    h = max_step  # Paso inicial
+    solz = []
+    sol_z = np.empty(zlocs)
+    sol_y = np.zeros((zlocs,zlocs))
+    #sol_y = np.array(soly.T)
+    print("sol_y:", np.shape(sol_y))
+    
+    if zlocs is None:
+        z_locs = np.arange(z0, zf, max_step)
+    else:
+        z_locs = np.linspace(z0, zf, zlocs+1)
+
+    #print(z_locs)
+    
+    loc_index = 0
+    
+    while z < zf:
+        ##SE PUEDE ELIMINAR ESTE WHILE
+        if loc_index < zlocs and z >= z_locs[loc_index]:
+            sol_z[loc_index] = z
+            sol_y[loc_index,:] = y
+            #print("A:",sol_z," le sumo:", z)
+            #print("A:",sol_y," le sumo:", y)
+            loc_index += 1
+        
+        if z + h > zf:
+            h = zf - z
+        
+        k1 = h * fun(z, y, *args)
+        k2 = h * fun(z + h/4, y + k1/4, *args)
+        k3 = h * fun(z + 3*h/8, y + 3*k1/32 + 9*k2/32, *args)
+        k4 = h * fun(z + 12*h/13, y + 1932*k1/2197 - 7200*k2/2197 + 7296*k3/2197, *args)
+        k5 = h * fun(z + h, y + 439*k1/216 - 8*k2 + 3680*k3/513 - 845*k4/4104, *args)
+        k6 = h * fun(z + h/2, y - 8*k1/27 + 2*k2 - 3544*k3/2565 + 1859*k4/4104 - 11*k5/40, *args)
+        
+        y_new = y + 25*k1/216 + 1408*k3/2565 + 2197*k4/4104 - k5/5
+        error = np.linalg.norm(y_new - (y + 16*k1/135 + 6656*k3/12825 + 28561*k4/56430 - 9*k5/50 + 2*k6/55))
+        
+        if error > atol + rtol * np.linalg.norm(y_new):
+            h *= 0.8 * (atol / error) ** 0.25  # Reducir el paso si el error es grande
+        else:
+            y = y_new
+            z += h
+            h *= 0.9 * (atol / error) ** 0.2  # Aumentar el paso si el error es bajo
+    
+    #print(y)
+
+    return (sol_z), (sol_y)

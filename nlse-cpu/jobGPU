@@ -1,0 +1,18 @@
+#! /bin/bash
+#
+#
+#$ -cwd
+#$ -j y
+#$ -S /bin/bash
+#$ -q copahue
+#$ -l memoria_a_usar=2G
+#$ -N nlse-cpu
+#
+
+#ejecutar binario con sus respectivos argumentos
+
+module load miniconda
+conda activate /share/apps/miniconda3/envs/rapids-23.04/
+python main.py 8
+
+
